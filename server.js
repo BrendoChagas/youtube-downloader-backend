@@ -2,17 +2,17 @@
 const youtubedl = require("youtube-dl-exec");
 const cors = require("cors");
 const fs = require("fs").promises;
-const fsSync = require("fs"); // Para operações síncronas
+const fsSync = require("fs");
 const path = require("path");
 const { exec } = require("child_process");
 const util = require("util");
+
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 
 console.log("Iniciando servidor...");
 console.log("youtube-dl-exec importado:", !!youtubedl);
 
-// Promisify exec para usar async/await
 const execPromise = util.promisify(exec);
 
 app.use(cors());
@@ -47,7 +47,6 @@ app.get("/temp/:filename", async (req, res) => {
 					console.error("Erro ao servir arquivo:", err);
 					res.status(500).send("Erro ao baixar o arquivo");
 				}
-				// Limpa o arquivo após o download
 				fs.unlink(filePath).catch((err) =>
 					console.error("Erro ao deletar arquivo:", err)
 				);
@@ -61,20 +60,71 @@ app.get("/temp/:filename", async (req, res) => {
 	}
 });
 
-app.get("/download", async (req, res) => {
+// Rota para listar formatos disponíveis (inspirado em /vf do y2mate)
+app.get("/formats", async (req, res) => {
 	try {
-		console.log("Recebida requisição para:", req.query.url);
-		const videoUrl = req.query.url;
+		let videoUrl = req.query.url;
 		if (!videoUrl) {
 			return res.status(400).json({ error: "URL do vídeo é obrigatória" });
 		}
 
-		// Obtém metadados para selecionar formato
+		// Remove parâmetros de playlist
+		videoUrl = videoUrl.replace(/&list=.*$|&index=.*$/, "");
+
+		// Obtém metadados com cookies
 		const info = await youtubedl(videoUrl, {
 			dumpSingleJson: true,
 			noWarnings: true,
+			cookies: "cookies.txt",
 			format:
 				"bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][acodec!=none][ext=mp4]/18",
+		});
+
+		// Filtra formatos relevantes
+		const formats = info.formats
+			.filter(
+				(f) => f.ext === "mp4" && f.vcodec !== "none" && f.acodec !== "none"
+			)
+			.map((f) => ({
+				itag: f.format_id,
+				quality: f.height ? `hd${f.height}` : "medium",
+				qualityLabel: f.height ? `${f.height}p` : f.format_note || "Unknown",
+				length: f.filesize || 0,
+				size: f.filesize
+					? `${(f.filesize / 1024 / 1024).toFixed(1)} MB`
+					: "Unknown",
+			}));
+
+		res.json({
+			formats,
+			duration: info.duration || 0,
+		});
+	} catch (error) {
+		console.error("Erro na rota /formats:", error.message);
+		res.status(500).json({ error: `Erro ao obter formatos: ${error.message}` });
+	}
+});
+
+// Rota para download com formato selecionado
+app.get("/download", async (req, res) => {
+	try {
+		let videoUrl = req.query.url;
+		const itag =
+			req.query.itag ||
+			"bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/18";
+		if (!videoUrl) {
+			return res.status(400).json({ error: "URL do vídeo é obrigatória" });
+		}
+
+		// Remove parâmetros de playlist
+		videoUrl = videoUrl.replace(/&list=.*$|&index=.*$/, "");
+
+		// Obtém metadados
+		const info = await youtubedl(videoUrl, {
+			dumpSingleJson: true,
+			noWarnings: true,
+			cookies: "cookies.txt",
+			format: itag,
 		});
 
 		console.log("Formato selecionado nos metadados:", {
@@ -94,21 +144,21 @@ app.get("/download", async (req, res) => {
 		const audioFile = path.join(tempDir, "audio_temp.m4a");
 		const mergedFile = path.join(tempDir, `video_merged_${Date.now()}.mp4`);
 
-		// Baixa vídeo e áudio separadamente
 		if (info.format_id.includes("+")) {
 			const [videoFormat, audioFormat] = info.format_id.split("+");
 			await youtubedl(videoUrl, {
 				format: videoFormat,
 				output: videoFile,
 				noWarnings: true,
+				cookies: "cookies.txt",
 			});
 			await youtubedl(videoUrl, {
 				format: audioFormat,
 				output: audioFile,
 				noWarnings: true,
+				cookies: "cookies.txt",
 			});
 
-			// Verifica se os arquivos foram criados
 			if (
 				!(await fs
 					.access(videoFile)
@@ -122,11 +172,11 @@ app.get("/download", async (req, res) => {
 				throw new Error("Falha ao baixar vídeo ou áudio temporário");
 			}
 		} else {
-			// Formato único (ex.: 18)
 			await youtubedl(videoUrl, {
 				format: info.format_id,
 				output: mergedFile,
 				noWarnings: true,
+				cookies: "cookies.txt",
 			});
 		}
 
@@ -136,21 +186,18 @@ app.get("/download", async (req, res) => {
 			console.log("Executando FFmpeg:", ffmpegCmd);
 			await execPromise(ffmpegCmd);
 
-			// Limpa arquivos temporários de vídeo e áudio
 			await fs
 				.unlink(videoFile)
 				.catch(() => console.log("Arquivo de vídeo temporário já deletado"));
 			await fs
 				.unlink(audioFile)
-				.catch(() => console.log("Arquivo de áudio and temporary já deletado"));
+				.catch(() => console.log("Arquivo de áudio temporário já deletado"));
 		}
 
-		// Retorna URL para o arquivo mesclado
 		const filename = path.basename(mergedFile);
-		const serveUrl = `http://localhost:${port}/temp/${filename}`;
+		const serveUrl = `https://seu-app.onrender.com/temp/${filename}`; // Substitua pela URL do Render
 		res.json({ videoUrl: serveUrl });
 
-		// Limpa arquivo mesclado após 5 minutos
 		setTimeout(async () => {
 			await fs
 				.unlink(mergedFile)
@@ -172,10 +219,6 @@ process.on("uncaughtException", (error) => {
 	console.error("Erro não tratado:", error.message, error.stack);
 });
 
-process.on("unhandledRejection", (reason, promise) => {
+process.on("unhandledRejection", (reason) => {
 	console.error("Rejeição não tratada:", reason);
 });
-
-setInterval(() => {
-	console.log("Servidor ainda rodando:", new Date().toLocaleTimeString());
-}, 30000);
